@@ -1,204 +1,343 @@
-"""Telegram message formatters.
+"""Telegram message formatters and keyboard menus.
 
-All output uses Markdown (legacy, not V2 — simpler escaping rules and supports
-the formatting density we need without per-character escaping).
-
-Visual structure mirrors the in-chat card preview:
-  - Header: City · Station · local-relative date
-  - Metrics: consensus / P(any wins) / confidence / sizing tier
-  - Buckets: ADJ_LOW · PRIMARY · ADJ_HIGH with prices and ENS probs
-  - Models: ECMWF / AIFS / GraphCast / GFS / HRRR readings
-  - Footer: SL/TP plan or skip reason
+Uses HTML mode (not Markdown) — way more reliable than legacy markdown,
+no escaping headaches with em-dashes, parentheses, accented city names, etc.
+Telegram HTML supports: <b> <i> <u> <s> <code> <pre> <a href> and that's it.
 """
 
 from __future__ import annotations
 
-import textwrap
+import html
 
-from cities import City
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
+
+from cities import US_CITIES, INTL_CITIES
 from scanner import ScanResult
-from strategy import Position, Recommendation, Role
+from strategy import Recommendation, Role
 from tracker import TrackedMarket
 import timeutil
 
 
-_ROLE_BADGE = {Role.ADJ_LOW: "ADJ-", Role.PRIMARY: "★ PRIMARY", Role.ADJ_HIGH: "ADJ+"}
-
-
-def _fmt_temp(v: float | None, unit: str) -> str:
-    return f"{v:.1f}°{unit}" if v is not None else "—"
-
-
-def _fmt_pct(v: float) -> str:
-    return f"{v * 100:.0f}%"
-
-
-def _bar(p: float, width: int = 10) -> str:
-    filled = round(p * width)
-    return "█" * filled + "░" * (width - filled)
+# ---------------------------------------------------------------------------
+# Persistent main menu (shows under the text input)
+# ---------------------------------------------------------------------------
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🔥 Top picks"), KeyboardButton("✓ Entry signals")],
+            [KeyboardButton("📅 Today"), KeyboardButton("🔭 Upcoming")],
+            [KeyboardButton("📡 Positions"), KeyboardButton("🔄 Refresh")],
+            [KeyboardButton("🌍 Cities"), KeyboardButton("ℹ️ Help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Forecast card — single market detail
+# Inline city pickers
+# ---------------------------------------------------------------------------
+def city_picker(action: str = "fc") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append([InlineKeyboardButton("── US ──", callback_data="noop")])
+    row: list[InlineKeyboardButton] = []
+    for c in US_CITIES:
+        row.append(InlineKeyboardButton(c.name, callback_data=f"{action}:{c.slug}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+
+    rows.append([InlineKeyboardButton("── International ──", callback_data="noop")])
+    row = []
+    for c in INTL_CITIES:
+        row.append(InlineKeyboardButton(c.name, callback_data=f"{action}:{c.slug}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def date_picker(city_slug: str, action: str = "fc") -> InlineKeyboardMarkup:
+    labels = ["Today", "+1 day", "+2 days", "+3 days", "+4 days"]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i, label in enumerate(labels):
+        row.append(InlineKeyboardButton(label, callback_data=f"{action}d:{city_slug}:{i}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("« Back to cities", callback_data=f"{action}:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def card_actions(city_slug: str, target_iso: str, is_tracked: bool) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(
+            "🗑 Stop tracking" if is_tracked else "📡 Track this market",
+            callback_data=f"{'untrack' if is_tracked else 'track'}:{city_slug}:{target_iso}",
+        ),
+        InlineKeyboardButton("🔄 Re-score", callback_data=f"refresh1:{city_slug}:{target_iso}"),
+    ]]
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# Card components
+# ---------------------------------------------------------------------------
+def _e(s) -> str:
+    return html.escape(str(s), quote=False)
+
+
+def _temp(v: float | None, unit: str) -> str:
+    return f"{v:.1f}°{unit}" if v is not None else "—"
+
+
+def _pct(v: float) -> str:
+    return f"{v * 100:.0f}%"
+
+
+def _bar(p: float, width: int = 12) -> str:
+    filled = max(0, min(width, round(p * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+_ROLE_BADGE = {
+    Role.ADJ_LOW:  "ADJ−",
+    Role.PRIMARY:  "★ PRIMARY",
+    Role.ADJ_HIGH: "ADJ+",
+}
+
+_TIER_EMOJI = {
+    "MAX":    "🟣",
+    "STRONG": "🔵",
+    "BASE":   "🟢",
+    "PROBE":  "🟡",
+    "SKIP":   "⚪",
+}
+
+
+# ---------------------------------------------------------------------------
+# Forecast card
 # ---------------------------------------------------------------------------
 def forecast_card(rec: Recommendation, htr: float) -> str:
     city = rec.event.city
     rel = timeutil.format_relative(city, rec.event.target_date)
-    when = rec.event.target_date.strftime("%a %b %-d") if hasattr(rec.event.target_date, "strftime") else str(rec.event.target_date)
+    when = rec.event.target_date.strftime("%a %b %d")
 
-    lines = []
-    lines.append(f"*{city.name}* · `{city.station_code}` · {when} ({rel})")
-    lines.append(f"_{city.station_name}_ — resolves at {city.unit}° on {city.source_label}")
+    header = (
+        f"<b>{_e(city.name)}</b>  ·  <code>{_e(city.station_code)}</code>\n"
+        f"<i>{_e(when)} · {_e(rel)}</i>\n"
+        f"<i>resolves at {city.unit}° on {_e(city.source_label)}</i>"
+    )
     if city.ai_trap:
-        lines.append(f"⚠️ AI summaries may cite {city.ai_trap} — resolution is `{city.station_code}`")
-    lines.append("")
+        header += f"\n⚠️ <i>AI summaries may cite {_e(city.ai_trap)} — actual: {_e(city.station_code)}</i>"
 
-    # Top metrics
-    consensus = _fmt_temp(rec.consensus, city.unit)
-    sizing = f"{rec.sizing_label}  ${rec.sizing_per_position:.2f}/bucket" if rec.enter_signal else rec.sizing_label
-    lines.append(f"📊 *Consensus*: {consensus}    *P(any wins)*: {_fmt_pct(rec.p_any_wins)}")
-    lines.append(f"🎯 *Confidence*: {_fmt_pct(rec.confidence)} {_bar(rec.confidence)}")
-    lines.append(f"💼 *Sizing*: {sizing}")
-    lines.append("")
+    consensus = _temp(rec.consensus, city.unit)
+    tier_emoji = _TIER_EMOJI.get(rec.sizing_label, "⚪")
+    if rec.enter_signal:
+        tier_line = f"{tier_emoji} <b>{_e(rec.sizing_label)}</b> · ${rec.sizing_per_position:.2f}/bucket"
+    else:
+        tier_line = f"{tier_emoji} <b>{_e(rec.sizing_label)}</b>"
 
-    # Buckets
-    lines.append("*Buckets*")
+    metrics = (
+        f"\n📊 Consensus <b>{_e(consensus)}</b>   "
+        f"P(any) <b>{_pct(rec.p_any_wins)}</b>\n"
+        f"🎯 Confidence <b>{_pct(rec.confidence)}</b>  <code>{_bar(rec.confidence)}</code>\n"
+        f"💼 {tier_line}"
+    )
+
+    bucket_lines = ["<pre>"]
+    bucket_lines.append("  Role        Bucket          Price   ENS")
+    bucket_lines.append("  ──────────  ──────────────  ──────  ────")
     for p in rec.positions:
         badge = _ROLE_BADGE[p.role]
-        ens = _fmt_pct(p.ens_prob)
-        line = f"  {badge:10}  `{p.bucket.label:14}`  {p.entry_price * 100:.0f}¢  ENS {ens}"
-        lines.append(line)
-    lines.append("")
+        ens = _pct(p.ens_prob)
+        price = f"{p.entry_price * 100:>4.0f}¢"
+        line = f"  {badge:<10}  {p.bucket.label:<14}  {price:>6}  {ens:>4}"
+        bucket_lines.append(line)
+    bucket_lines.append("</pre>")
+    buckets_block = "\n".join(bucket_lines)
 
-    # Model breakdown
-    lines.append("*Models*")
+    model_lines = ["<pre>"]
+    model_lines.append("  Model           Forecast")
+    model_lines.append("  ──────────────  ─────────────────")
     for m in rec.bundle.deterministic:
         flag = ""
         if city.slug == "denver" and m.model_id == "gfs_global":
-            flag = " _(down-weighted: cold-air damming)_"
-        lines.append(f"  • {m.name:14} {_fmt_temp(m.daily_max, city.unit)}{flag}")
+            flag = "  (down-weighted)"
+        model_lines.append(f"  {m.name:<14}  {_temp(m.daily_max, city.unit):<8}{flag}")
     if rec.bundle.hrrr is not None:
         if rec.bundle.hrrr.daily_max is not None:
-            lines.append(f"  • HRRR           {_fmt_temp(rec.bundle.hrrr.daily_max, city.unit)}  _(0-48h)_")
+            model_lines.append(f"  {'HRRR':<14}  {_temp(rec.bundle.hrrr.daily_max, city.unit):<8}  (0-48h)")
         else:
-            lines.append("  • HRRR           — _(out of range, >48h)_")
+            model_lines.append(f"  {'HRRR':<14}  —         (out of range)")
     if rec.bundle.ensemble:
         ens = rec.bundle.ensemble
-        med = _fmt_temp(ens.median, city.unit)
-        sd = f"±{ens.stdev:.1f}" if ens.stdev is not None else ""
-        lines.append(f"  • {ens.name}  {med} {sd} ({len(ens.members)} members)")
-    lines.append("")
+        med = _temp(ens.median, city.unit)
+        sd = f"±{ens.stdev:.1f}" if ens.stdev is not None else "—"
+        model_lines.append(f"  {ens.name:<14}  {med}  {sd}  ({len(ens.members)}m)")
+    model_lines.append("</pre>")
+    models_block = "\n".join(model_lines)
 
-    # SL/TP plan or skip reason
     if rec.enter_signal:
-        lines.append("*Entry plan*")
+        plan_lines = ["<b>📋 Entry plan</b>"]
         for p in rec.positions:
             if p.role is Role.PRIMARY:
-                lines.append(f"  ★ Hold `{p.bucket.label}` to resolution · SL {p.sl * 100:.0f}¢")
+                plan_lines.append(
+                    f"  ★ Hold <code>{_e(p.bucket.label)}</code> to resolution · SL {p.sl * 100:.0f}¢"
+                )
             else:
                 tp = f"TP {p.tp * 100:.0f}¢" if p.tp else "—"
-                lines.append(f"  · `{p.bucket.label}` SL {p.sl * 100:.0f}¢ / {tp}")
-        lines.append("")
-        lines.append(f"⏱ {htr:.1f}h to resolution · /track {city.slug} {rec.event.target_date}")
+                plan_lines.append(
+                    f"  · <code>{_e(p.bucket.label)}</code> SL {p.sl * 100:.0f}¢ / {tp}"
+                )
+        plan_lines.append(f"\n⏱ <b>{htr:.0f}h</b> to resolution")
+        plan = "\n".join(plan_lines)
     else:
-        lines.append(f"❌ *Skip*: {rec.skip_reason}")
+        plan = f"❌ <b>Skip:</b> <i>{_e(rec.skip_reason)}</i>"
 
-    lines.append("")
-    lines.append(f"🔗 [{city.source_label}]({city.source_url}) · [Polymarket](https://polymarket.com/event/{rec.event.slug})")
-    return "\n".join(lines)
+    links = (
+        f"\n🔗 <a href=\"{city.source_url}\">{_e(city.source_label)}</a> · "
+        f"<a href=\"https://polymarket.com/event/{rec.event.slug}\">Polymarket</a>"
+    )
+
+    return "\n\n".join([header, metrics, buckets_block, models_block, plan + links])
 
 
 # ---------------------------------------------------------------------------
-# Scan summary — top-N across all cities
+# Scan summary
 # ---------------------------------------------------------------------------
-def scan_summary(results: list[ScanResult], title: str = "🔥 Top opportunities") -> str:
+def scan_summary(results: list[ScanResult], title: str) -> str:
     if not results:
-        return "_No opportunities found in the current scan window._"
+        return (
+            f"<b>{_e(title)}</b>\n\n"
+            "<i>No opportunities found in the current scan window.</i>\n"
+            "<i>Polymarket may not have listed forward markets yet — try again later.</i>"
+        )
 
-    lines = [f"*{title}*", ""]
-    lines.append("`Conf  P-any  $/buc  Tier      City · date · station`")
+    lines = [f"<b>{_e(title)}</b>", ""]
+    lines.append("<pre>")
+    lines.append("  Conf  P-any  Tier     City · when")
+    lines.append("  ────  ─────  ───────  ──────────────────────────")
     for r in results:
         rec = r.rec
         city = rec.event.city
         rel = timeutil.format_relative(city, rec.event.target_date)
-        size = f"${rec.sizing_per_position:.2f}" if rec.enter_signal else " —"
-        flag = "✓" if rec.enter_signal else "·"
+        flag = "✓" if rec.enter_signal else " "
         lines.append(
-            f"`{flag} {rec.confidence * 100:3.0f}%  {rec.p_any_wins * 100:3.0f}%  {size:>5}  {rec.sizing_label:8}` "
-            f"{city.name} · {rel} · `{city.station_code}`"
+            f"{flag} {rec.confidence * 100:>3.0f}%  {rec.p_any_wins * 100:>3.0f}%   "
+            f"{rec.sizing_label:<7}  {city.name} · {rel}"
         )
+    lines.append("</pre>")
     lines.append("")
-    lines.append("_Tap any city with `/forecast <city>` for the full card._")
+    lines.append("<i>Tap a city below for the full card.</i>")
     return "\n".join(lines)
 
 
+def scan_keyboard(results: list[ScanResult]) -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    seen: set[str] = set()
+    for r in results[:18]:
+        city = r.rec.event.city
+        days_out = max(0, (r.rec.event.target_date - timeutil.station_today(city)).days)
+        key = f"{city.slug}:{days_out}"
+        if key in seen:
+            continue
+        seen.add(key)
+        emoji = _TIER_EMOJI.get(r.rec.sizing_label, "⚪")
+        label = f"{emoji} {city.name} +{days_out}d"
+        row.append(InlineKeyboardButton(label, callback_data=f"fcd:{city.slug}:{days_out}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 # ---------------------------------------------------------------------------
-# Tracker view — currently watched markets with refinement deltas
+# Tracker view
 # ---------------------------------------------------------------------------
 def tracker_summary(tracked: list[TrackedMarket]) -> str:
     if not tracked:
-        return "_You're not tracking any markets yet. Use `/track <city> <YYYY-MM-DD>`._"
+        return (
+            "<b>📡 Tracked positions</b>\n\n"
+            "<i>You're not tracking any markets yet.</i>\n"
+            "Find one with 🔥 Top picks, then tap 📡 Track this market on its card."
+        )
 
-    lines = ["*📡 Tracked positions*", ""]
+    lines = ["<b>📡 Tracked positions</b>", ""]
+    lines.append("<pre>")
+    lines.append("  Conf  Δ      Action  City · target")
+    lines.append("  ────  ─────  ──────  ──────────────────")
     for tm in tracked:
         cp = tm.latest
         if cp is None:
             continue
-        delta = cp.confidence - tm.initial_confidence
-        arrow = "↑" if delta > 0.05 else "↓" if delta < -0.05 else "→"
+        delta = (cp.confidence - tm.initial_confidence) * 100
+        arrow = "↑" if delta > 5 else "↓" if delta < -5 else "→"
         lines.append(
-            f"• `{tm.city_slug:12}` {tm.target_date}  "
-            f"conf {cp.confidence * 100:.0f}% {arrow} ({delta * 100:+.0f}%)  "
-            f"{cp.action} · {cp.sizing_label}"
+            f"  {cp.confidence * 100:>3.0f}%  {arrow}{abs(delta):>4.0f}%  "
+            f"{cp.action:<6}  {tm.city_slug} · {tm.target_date}"
         )
-        lines.append(
-            f"   {cp.hours_to_resolution:.0f}h out · primary {cp.p_primary_wins * 100:.0f}% · "
-            f"any {cp.p_any_wins * 100:.0f}%"
-        )
+    lines.append("</pre>")
     lines.append("")
-    lines.append("_Refresh anytime with `/refresh`. Remove with `/untrack <city> <date>`._")
+    lines.append("<i>Hourly auto-refresh; tap 🔄 Refresh for now.</i>")
     return "\n".join(lines)
 
 
+def tracker_keyboard(tracked: list[TrackedMarket]) -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for tm in tracked[:12]:
+        label = f"{tm.city_slug} {tm.target_date[5:]}"
+        row.append(InlineKeyboardButton(label, callback_data=f"view:{tm.city_slug}:{tm.target_date}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 # ---------------------------------------------------------------------------
-# Help / cities
+# Help & cities
 # ---------------------------------------------------------------------------
-HELP = textwrap.dedent("""\
-    *Polymarket weather bot*
-
-    *Daily flow*
-    `/scan` — confidence-ranked picks across all 35 cities, 0–3 days out
-    `/today` — markets resolving today (per-city local time)
-    `/upcoming` — markets resolving in the next 1–3 days
-    `/forecast <city> [YYYY-MM-DD]` — full card for one city/date
-    `/track <city> <YYYY-MM-DD>` — start tracking a market through resolution
-    `/positions` — your tracked markets with confidence drift
-    `/untrack <city> <YYYY-MM-DD>` — stop tracking
-    `/refresh` — re-score all tracked markets right now
-    `/cities` — list all 35 cities and their resolution stations
-    `/help` — this message
-
-    *Confidence tiers (sizing)*
-    ≥90% MAX 2.0× · ≥80% STRONG 1.5× · ≥70% BASE 1.0× · ≥60% PROBE 0.5× · <60% SKIP
-
-    *Strategy primer*
-    Three-bucket structure centered on ECMWF/AIFS/GraphCast consensus.
-    Phase 1 entry 25–40¢. Phase 2 fires SL on collapsing low + adj TP on reprice.
-    Primary held to resolution.
-    """).strip()
+HELP = (
+    "<b>🌡 Polymarket weather bot</b>\n\n"
+    "Use the menu below for everyday actions, or type:\n\n"
+    "<b>/scan</b> — top picks across all 36 cities\n"
+    "<b>/today</b> · <b>/upcoming</b> — by horizon\n"
+    "<b>/forecast</b> [city] [date] — full card\n"
+    "<b>/track</b> [city] [date] — start tracking\n"
+    "<b>/positions</b> · <b>/refresh</b> · <b>/cities</b>\n\n"
+    "<b>Sizing tiers</b>\n"
+    "🟣 MAX 2.0× · 🔵 STRONG 1.5× · 🟢 BASE 1.0× · 🟡 PROBE 0.5× · ⚪ SKIP\n\n"
+    "<b>Strategy</b>\n"
+    "Three-bucket structure on ECMWF/AIFS/GraphCast consensus.\n"
+    "Phase 1: enter all 3 at 25-40¢, 3 days out.\n"
+    "Phase 2 (12-24h): SL on collapsing low, TP on adj reprice, primary held to resolution."
+)
 
 
-def cities_list(cities: list[City]) -> str:
-    lines = ["*Tracked cities*", ""]
-    by_unit = {"F": [], "C": []}
-    for c in cities:
-        trap = f"  ⚠️ AI cites {c.ai_trap}" if c.ai_trap else ""
-        by_unit[c.unit].append(f"  • `{c.slug:14}` {c.name} — `{c.station_code}` ({c.station_name}){trap}")
-    if by_unit["F"]:
-        lines.append("*US (°F, 2° buckets)*")
-        lines.extend(by_unit["F"])
-        lines.append("")
-    if by_unit["C"]:
-        lines.append("*International (°C, 1° buckets)*")
-        lines.extend(by_unit["C"])
+def cities_list_text() -> str:
+    lines = ["<b>🌍 Tracked cities</b>", ""]
+    lines.append("<b>US (°F, 2° buckets)</b>")
+    for c in US_CITIES:
+        trap = f"  ⚠️ <i>AI cites {_e(c.ai_trap)}</i>" if c.ai_trap else ""
+        lines.append(f"  • <b>{_e(c.name)}</b> — <code>{_e(c.station_code)}</code>{trap}")
+    lines.append("")
+    lines.append("<b>International (°C, 1° buckets)</b>")
+    for c in INTL_CITIES:
+        src = "" if c.resolution_source == "wunderground" else f" <i>({_e(c.source_label)})</i>"
+        lines.append(f"  • <b>{_e(c.name)}</b> — <code>{_e(c.station_code)}</code>{src}")
     return "\n".join(lines)
+
+
+WELCOME = (
+    "<b>👋 Welcome to your Polymarket weather bot</b>\n\n"
+    "Tracking <b>36 cities</b> across Wunderground + HK Observatory.\n"
+    "Tap <b>🔥 Top picks</b> below to see what's worth a look right now."
+)
