@@ -122,7 +122,14 @@ _TIER_EMOJI = {
 # ---------------------------------------------------------------------------
 # Forecast card
 # ---------------------------------------------------------------------------
-def forecast_card(rec: Recommendation, htr: float) -> str:
+    # Live METAR
+    live_line = ""
+    if rec.bundle.metar and rec.bundle.metar.temp_f is not None:
+        obs = rec.bundle.metar
+        time_str = obs.obs_time.strftime("%H:%MZ") if obs.obs_time else "recent"
+        live_line = f"📡 <b>Live station</b>: {obs.temp_str} at {time_str}\n"
+        
+    def forecast_card(rec: Recommendation, htr: float) -> str:
     city = rec.event.city
     rel = timeutil.format_relative(city, rec.event.target_date)
     when = rec.event.target_date.strftime("%a %b %d")
